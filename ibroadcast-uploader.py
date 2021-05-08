@@ -17,7 +17,7 @@ if not os.environ.get("DEBUG", False):
     sys.tracebacklimit = 0
 
 
-API_URL = "https://api.ibroadcast.com/s/JSON/"
+API_URL = "https://api.ibroadcast.com/"
 UPLOAD_URL = "https://upload.ibroadcast.com/"
 
 USER_AGENT = "python 3 uploader script 0.3"
