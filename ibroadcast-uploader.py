@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor as PoolExecutor, as_completed
 
 import requests
 
@@ -47,7 +48,7 @@ class Uploader(object):
         self.user_id = None
         self.token = None
 
-    def process(self, parent_dirs=[], tag_names=[], skip_duplicates=True):
+    def process(self, parent_dirs=[], tag_names=[], skip_duplicates=True, parallel=True):
         try:
             self.login()
         except ValueError as e:
@@ -66,7 +67,7 @@ class Uploader(object):
 
         if self.confirm(files):
             tag_ids = self.load_tag_ids(*tag_names)
-            self.upload(files, tag_ids, skip_duplicates)
+            self.upload(files, tag_ids, skip_duplicates, parallel)
 
     def _request(self, url, data, encode_data=lambda val: val, **req_args):
         # provide the auth parameters if they"re set.
@@ -194,24 +195,12 @@ class Uploader(object):
                 m.update(data)
         return m.hexdigest()
 
-    def upload(self, files, tag_ids=[], skip_duplicates=True):
+    def upload(self, files, tag_ids=[], skip_duplicates=True, parallel=True):
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
-        if skip_duplicates:
-            library_md5s = self._upload_request()["md5"]
-
-        uploaded_track_ids = set()
-        for filepath in sorted(files):
-            print("Uploading ", filepath)
-
-            if skip_duplicates:
-                # Get an md5 of the file contents and compare it to whats up
-                # there already
-                file_md5 = self.calcmd5(filepath)
-                if file_md5 in library_md5s:
-                    print("Skipping - already uploaded.")
-                    continue
+        def _upload_worker(filepath):
+            print(f"Uploading {filepath}...")
 
             with open(filepath, "rb") as upload_file:
                 jsoned = self._upload_request(
@@ -240,7 +229,33 @@ class Uploader(object):
             for tag_id in tag_ids:
                 self._api_request("tagtracks", tagid=tag_id, tracks=[track_id])
 
-            uploaded_track_ids.add(track_id)
+            print(f"Finished {filepath} ({track_id})")
+
+            return track_id
+
+        if skip_duplicates:
+            library_md5s = self._upload_request()["md5"]
+
+        # For now at least, parallel uploads are all or nothing: either the
+        # default max workers are used, or one is used.
+        max_workers = None if parallel else 1
+        with PoolExecutor(max_workers=max_workers) as executor:
+            promises = []
+            uploaded_track_ids = set()
+            for filepath in sorted(files):
+                if skip_duplicates:
+                    # Get an md5 of the file contents and compare it to whats up
+                    # there already
+                    file_md5 = self.calcmd5(filepath)
+                    if file_md5 in library_md5s:
+                        print(f"Skipping {filepath} - already uploaded.")
+                        continue
+
+                promises.append(executor.submit(_upload_worker, filepath))
+
+            for promise in as_completed(promises):
+                track_id = promise.result()
+                uploaded_track_ids.add(track_id)
 
         print("Done")
 
@@ -258,6 +273,8 @@ def parse_args():
             help=("Directory in which to search for music files. Repeat to "
             "search in multiple directories. Default: %(default)s"))
     parser.add_argument("-t", "--tag", action="append", dest="tags")
+    parser.add_argument("--no-parallel", action="store_false", dest="parallel",
+            help="Disable parallel uploads.")
     parser.add_argument("--no-skip-duplicates", action="store_false",
             dest="skip_duplicates",
             help=("Upload a file even when iBroadcast thinks it's already "
@@ -270,4 +287,4 @@ if __name__ == "__main__":
 
     uploader = Uploader(args.login_token)
 
-    uploader.process(args.directories, args.tags, args.skip_duplicates)
+    uploader.process(args.directories, args.tags, args.skip_duplicates, args.parallel)
