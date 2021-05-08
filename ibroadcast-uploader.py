@@ -47,7 +47,7 @@ class Uploader(object):
         self.user_id = None
         self.token = None
 
-    def process(self, parent_dir, tag_names=[]):
+    def process(self, parent_dirs=[], tag_names=[]):
         try:
             self.login()
         except ValueError as e:
@@ -60,7 +60,10 @@ class Uploader(object):
             print("Unable to fetch account info: %s" % e)
             return
 
-        files = self.load_files(parent_dir, filetypes)
+        files = set()
+        for parent_dir in parent_dirs:
+            files.update(self.load_files(parent_dir, filetypes))
+
         if self.confirm(files):
             tag_ids = self.load_tag_ids(*tag_names)
             self.upload(files, tag_ids)
@@ -249,8 +252,10 @@ def parse_args():
             help=("Your login token. If you don't already have one, visit "
             "https://ibroadcast.com, log into your account, click the \"Apps\" "
             "button in the side menu, and enable the app."))
-    parser.add_argument("-d", "--directory", type=pathlib.Path, default=os.getcwd(),
-            help=("Parent directory of your music files."))
+    parser.add_argument("-d", "--directory", action="append", type=pathlib.Path,
+            default=[os.getcwd()], dest="directories",
+            help=("Directory in which to search for music files. Repeat to "
+            "search in multiple directories. Default: %(default)s"))
     parser.add_argument("-t", "--tag", action="append", dest="tags")
 
     return parser.parse_args()
@@ -260,4 +265,4 @@ if __name__ == "__main__":
 
     uploader = Uploader(args.login_token)
 
-    uploader.process(args.directory, args.tags)
+    uploader.process(args.directories, args.tags)
