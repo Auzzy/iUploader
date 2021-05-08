@@ -1,25 +1,38 @@
 #!/usr/bin/env python
 
-import requests
-import json
+import argparse
 import glob
-import os
 import hashlib
+import json
+import os
+import pathlib
+import re
 import sys
-import traceback
 
-sys.tracebacklimit = 0
+import requests
 
-def get_input(inp):
-    if sys.version_info >= (3, 0):
-        return input(inp)
-    else:
-        return raw_input(inp)
+
+if not os.environ.get("DEBUG", False):
+    sys.tracebacklimit = 0
+
+
+API_URL = "https://api.ibroadcast.com/s/JSON/"
+UPLOAD_URL = "https://upload.ibroadcast.com/"
+
+USER_AGENT = "python 3 uploader script 0.3"
+CLIENT = "python 3 uploader script"
+BASE_API_PAYLOAD = {
+    "app_id": 1007,
+    "version": "0.3",
+    "client": CLIENT,
+    "device_name": "python 3 uploader script",
+    "user_agent": USER_AGENT
+}
+
+TRACK_ID_RE_FORMAT = "File {} \((?P<trackid>\d+)\) uploaded successfully and is being processed."
+
 
 class ServerError(Exception):
-    pass
-
-class ValueError(Exception):
     pass
 
 class Uploader(object):
@@ -27,207 +40,149 @@ class Uploader(object):
     Class for uploading content to iBroadcast.
     """
 
-    VERSION = '0.3'
-    CLIENT = 'python 3 uploader script'
-    DEVICE_NAME = 'python 3 uploader script'
-    USER_AGENT = 'python 3 uploader script 0.3'
-
-
     def __init__(self, login_token):
         self.login_token = login_token
 
         # Initialise our variables that each function will set.
         self.user_id = None
         self.token = None
-        self.supported = None
-        self.files = None
-        self.md5 = None
 
-    def process(self):
+    def process(self, parent_dir, tag_names=[]):
         try:
             self.login()
         except ValueError as e:
-            print('Login failed: %s' % e)
+            print("Login failed: %s" % e)
             return
 
         try:
-            self.get_supported_types()
+            filetypes = self.get_supported_filetypes()
         except ValueError as e:
-            print('Unable to fetch account info: %s' % e)
+            print("Unable to fetch account info: %s" % e)
             return
 
-        self.load_files()
+        files = self.load_files(parent_dir, filetypes)
+        if self.confirm(files):
+            tag_ids = self.load_tag_ids(*tag_names)
+            self.upload(files, tag_ids)
 
-        if self.confirm():
-            self.upload()
-            self.tag("test-tag")
+    def _request(self, url, data, encode_data=lambda val: val, **req_args):
+        # provide the auth parameters if they"re set.
+        if self.user_id:
+            data["user_id"] = self.user_id
+        if self.token:
+            data["token"] = self.token
 
-    def login(self, login_token=None,):
-        """
-        Login to iBroadcast with the given login_token
+        headers = {**req_args.pop("headers", {}), "User-Agent": USER_AGENT}
 
-        Raises:
-            ValueError on invalid login
+        response = requests.post(url, data=encode_data(data), headers=headers, **req_args)
 
-        """
+        if not response.ok:
+            raise ServerError("Server returned bad status: ", response.status_code)
+
+        return response.json()
+
+    def _api_request(self, mode, **data):
+        post_json = {
+            "mode": mode,
+            **data,
+            **BASE_API_PAYLOAD
+        }
+        return self._request(API_URL, post_json, json.dumps)
+
+    def _upload_request(self, *, files={}, **data):
+        return self._request(UPLOAD_URL, data, files=files)
+
+    def login(self, login_token=None):
         # Default to passed in values, but fallback to initial data.
         login_token = login_token or self.login_token
 
-        print('Logging in...')
-        # Build a request object.
-        post_data = json.dumps({
-            'mode' : 'login_token',
-            'login_token': login_token,
-            'app_id': 1007,
-            'type': 'account',
-            'version': self.VERSION,
-            'client': self.CLIENT,
-            'device_name' : self.DEVICE_NAME,
-            'user_agent' : self.USER_AGENT
-        })
-        print(post_data)
-        response = requests.post(
-            "https://api.ibroadcast.com/s/JSON/",
-            data=post_data,
-            headers={'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}
-        )
-        print({'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT})
+        print("Logging in...")
+        jsoned = self._api_request("login_token", login_token=login_token, type="account")
 
-        exit()
-
-        if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                             response.status_code)
-
-        jsoned = response.json()
-
-        if 'user' not in jsoned:
+        if "user" not in jsoned:
             raise ValueError(jsoned.message)
 
-        print('Login successful - user_id: ', jsoned['user']['id'])
-        self.user_id = jsoned['user']['id']
-        self.token = jsoned['user']['token']
+        print("Login successful - user_id: ", jsoned["user"]["id"])
+        self.user_id = jsoned["user"]["id"]
+        self.token = jsoned["user"]["token"]
 
-    def get_supported_types(self):
-        """
-        Get supported file types
-
-        Raises:
-            ValueError on invalid login
-
-        """
-        print('Fetching account info...')
-        # Build a request object.
-        post_data = json.dumps({
-            'mode' : 'status',
-            'user_id': self.user_id,
-            'token': self.token,
-            'supported_types': 1,
-            'version': self.VERSION,
-            'client': self.CLIENT,
-            'device_name' : self.DEVICE_NAME,
-            'user_agent' : self.USER_AGENT
-        })
-        response = requests.post(
-            "https://api.ibroadcast.com/s/JSON/",
-            data=post_data,
-            headers={'Content-Type': 'application/json', 'User-Agent': self.USER_AGENT}
-        )
-
-        if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                             response.status_code)
-
-        jsoned = response.json()
-
-        if 'user' not in jsoned:
+    def get_supported_filetypes(self):
+        jsoned = self._api_request("status", supported_types=1)
+        if "user" not in jsoned:
             raise ValueError(jsoned.message)
 
-        print('Account info fetched')
+        print("Account info fetched")
 
-        self.supported = []
-        self.files = []
+        return {filetype["extension"] for filetype in jsoned["supported"]}
 
-        for filetype in jsoned['supported']:
-             self.supported.append(filetype['extension'])
+    def load_files(self, directory, filetypes):
+        if filetypes is None:
+            raise ValueError("Supported not yet set - have you logged in yet?")
 
-    def load_files(self, directory=None):
-        """
-        Load all files in the directory that match the supported extension list.
-
-        directory defaults to present working directory.
-
-        raises:
-            ValueError if supported is not yet set.
-        """
-        if self.supported is None:
-            raise ValueError('Supported not yet set - have you logged in yet?')
-
-        if not directory:
-            directory = os.getcwd()
-
-        for full_filename in glob.glob(os.path.join(directory, '*')):
+        files = set()
+        for full_filename in glob.glob(os.path.join(directory, "*")):
             filename = os.path.basename(full_filename)
             # Skip hidden files.
-            if filename.startswith('.'):
+            if filename.startswith("."):
                 continue
 
-            # Make sure it's a supported extension.
+            # Make sure it"s a supported extension.
             dummy, ext = os.path.splitext(full_filename)
-            if ext in self.supported:
-                self.files.append(full_filename)
+            if ext in filetypes:
+                files.add(full_filename)
 
             # Recurse into subdirectories.
             # XXX Symlinks may cause... issues.
             if os.path.isdir(full_filename):
                 self.load_files(full_filename)
 
-    def confirm(self):
+        return files
+
+    def confirm(self, files):
         """
         Presents a dialog for the user to either list all files, or just upload.
         """
-        print("Found %s files.  Press 'L' to list, or 'U' to start the " \
-              "upload." % len(self.files))
-        response = get_input('--> ')
+        print(f"Found {len(files)} files. Press \"L\" to list, or \"U\" to "
+            "start the upload.")
+        response = input("--> ")
 
         print()
-        if response == 'L'.upper():
-            print('Listing found, supported files')
-            for filename in self.files:
-                print(' - ', filename)
+        if response.lower() == "l":
+            print("Listing found, supported files")
+            for filename in sorted(files):
+                print(f" - {filename}")
             print()
-            print("Press 'U' to start the upload if this looks reasonable.")
-            response = get_input('--> ')
-        if response == 'U'.upper():
-            print('Starting upload.')
+            print("Press "U" to start the upload if this looks reasonable.")
+            response = input("--> ")
+        if response.lower() == "u":
+            print("Starting upload.")
             return True
 
-        print('Aborting')
+        print("Aborting")
         return False
 
-    def __load_md5(self):
-        """
-        Reach out to iBroadcast and get an md5.
-        """
-        post_data = "user_id=%s&token=%s" % (self.user_id, self.token)
+    def load_tag_ids(self, *tag_names):
+        tags_info = self._api_request("library")["library"]["tags"]
 
-        # Send our request.
-        response = requests.post(
-            "https://upload.ibroadcast.com",
-            data=post_data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
-        )
+        # Tags have their ID as the key, and the name inside. So we need to
+        # iterate over all of them, checking whose names are in the requested
+        # list, and collection those IDs.
+        tag_ids = set()
+        missing_tags = set(tag_names)
+        for tag_id, info in tags_info.items():
+            if info["name"] in tag_names:
+                tag_ids.add(tag_id)
+                missing_tags.remove(info["name"])
 
-        if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                             response.status_code)
+        # If any of the requested tag names were not found, we create them, and
+        # add their ID to the list.
+        for tag_name in missing_tags:
+            tag_ids.add(self._api_request("createtag", tagname=tag_name)["id"])
 
-        jsoned = response.json()
-
-        self.md5 = jsoned['md5']
+        return tag_ids
 
     def calcmd5(self, filePath="."):
-        with open(filePath, 'rb') as fh:
+        with open(filePath, "rb") as fh:
             m = hashlib.md5()
             while True:
                 data = fh.read(8192)
@@ -236,88 +191,73 @@ class Uploader(object):
                 m.update(data)
         return m.hexdigest()
 
-    def upload(self):
+    def upload(self, files, tag_ids=[]):
         """
-        Go and perform an upload of any files that haven't yet been uploaded
+        Go and perform an upload of any files that haven"t yet been uploaded
         """
-        self.__load_md5()
+        library_md5s = self._upload_request()["md5"]
 
-        for filename in self.files:
-
-            print('Uploading ', filename)
+        uploaded_track_ids = set()
+        for filepath in sorted(files):
+            print("Uploading ", filepath)
 
             # Get an md5 of the file contents and compare it to whats up
             # there already
-            file_md5 = self.calcmd5(filename)
+            file_md5 = self.calcmd5(filepath)
 
-            if file_md5 in self.md5:
-                print('Skipping - already uploaded.')
+            if file_md5 in library_md5s:
+                print("Skipping - already uploaded.")
                 continue
-            upload_file = open(filename, 'rb')
 
-            file_data = {
-                'file': upload_file,
-            }
+            with open(filepath, "rb") as upload_file:
+                jsoned = self._upload_request(
+                    file_path=filepath,
+                    method=CLIENT,
+                    files={"file": upload_file})
 
-            post_data = {
-                'user_id': self.user_id,
-                'token': self.token,
-                'file_path' : filename,
-                'method': self.CLIENT,
-            }
-
-            response = requests.post(
-                "https://upload.ibroadcast.com",
-                post_data,
-                files=file_data,
-
-            )
-
-            upload_file.close()
-
-            if not response.ok:
-                raise ServerError('Server returned bad status: ',
-                    response.status_code)
-            jsoned = response.json()
-            print(jsoned)
-            result = jsoned['result']
+            result = jsoned["result"]
 
             if result is False:
-                raise ValueError('File upload failed.')
-        print('Done')
+                raise ValueError("File upload failed.")
+
+            # Extracting the ID of the uploaded track.
+            track_id_re = TRACK_ID_RE_FORMAT.format(os.path.basename(filepath))
+            match = re.match(track_id_re, jsoned["message"])
+            if not match:
+                raise ValueError(f"Unexpected message format. Maybe it's changed? '{jsoned['message']}'")
+
+            track_id = int(match.group("trackid"))
+
+            # Tagging the track. Immediately tagging ensures a script failure
+            # will leave at most one untagged track.
+            # The tradeoff is it takes a LOT more requests, so more time and
+            # server load. Best would be for the API to support tagging as part
+            # of the upload request.
+            for tag_id in tag_ids:
+                self._api_request("tagtracks", tagid=tag_id, tracks=[track_id])
+
+            uploaded_track_ids.add(track_id)
+
+        print("Done")
+
+        return uploaded_track_ids
 
 
-    def _get_lib(self):
-        requests.post("https://api.ibroadcast.com/s/JSON/", headers={"User-Agent": "python 3 uploader script 0.3"}, json={'app_id': 1007, 'version': 0.3, 'client': 'python 3 uploader script', 'device_name': 'python 3 uploader script', 'user_agent': 'python 3 uploader script 0.3', 'user_id': 2217732, 'token': '6fcbcb45-aa75-11eb-ad2e-1418774e50a6', 'mode': 'library'}).json()
-        pass
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("login_token",
+            help=("Your login token. If you don't already have one, visit "
+            "https://ibroadcast.com, log into your account, click the \"Apps\" "
+            "button in the side menu, and enable the app."))
+    parser.add_argument("-d", "--directory", type=pathlib.Path, default=os.getcwd(),
+            help=("Parent directory of your music files."))
+    parser.add_argument("-t", "--tag", action="append", dest="tags")
 
-    def tag(self, *tag_names):
-        tag_ids = {}
+    return parser.parse_args()
 
-        post_data = {
-            'user_agent' : self.USER_AGENT,
-            'device_name' : self.DEVICE_NAME,
-            'version': self.VERSION,
-            'client': self.CLIENT,
-            'mode' : 'tagtracks',
-            'tagid': 0,
-            'tracks': [0]
-        }
-        response = requests.post(
-            "https://api.ibroadcast.com/s/JSON/",
-            json=post_data,
-            headers={'User-Agent': self.USER_AGENT}
-        )
+if __name__ == "__main__":
+    args = parse_args()
 
+    uploader = Uploader(args.login_token)
 
-if __name__ == '__main__':
-    # NB: this could use parsearg
-    if len(sys.argv) != 2:
-        print("Run this script in the parent directory of your music files.\n")
-        print("To acquire a login token, enable the \"Simple Uploaders\" app by visiting https://ibroadcast.com, logging in to your account, and clicking the \"Apps\" button in the side menu.\n")
-        print("Usage: ibroadcast-uploader.py <login_token>\n")
-        sys.exit(1)
-
-    uploader = Uploader(sys.argv[1])
-
-    uploader.process()
+    uploader.process(args.directory, args.tags)
