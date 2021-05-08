@@ -47,7 +47,7 @@ class Uploader(object):
         self.user_id = None
         self.token = None
 
-    def process(self, parent_dirs=[], tag_names=[]):
+    def process(self, parent_dirs=[], tag_names=[], skip_duplicates=True):
         try:
             self.login()
         except ValueError as e:
@@ -66,7 +66,7 @@ class Uploader(object):
 
         if self.confirm(files):
             tag_ids = self.load_tag_ids(*tag_names)
-            self.upload(files, tag_ids)
+            self.upload(files, tag_ids, skip_duplicates)
 
     def _request(self, url, data, encode_data=lambda val: val, **req_args):
         # provide the auth parameters if they"re set.
@@ -194,23 +194,24 @@ class Uploader(object):
                 m.update(data)
         return m.hexdigest()
 
-    def upload(self, files, tag_ids=[]):
+    def upload(self, files, tag_ids=[], skip_duplicates=True):
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
-        library_md5s = self._upload_request()["md5"]
+        if skip_duplicates:
+            library_md5s = self._upload_request()["md5"]
 
         uploaded_track_ids = set()
         for filepath in sorted(files):
             print("Uploading ", filepath)
 
-            # Get an md5 of the file contents and compare it to whats up
-            # there already
-            file_md5 = self.calcmd5(filepath)
-
-            if file_md5 in library_md5s:
-                print("Skipping - already uploaded.")
-                continue
+            if skip_duplicates:
+                # Get an md5 of the file contents and compare it to whats up
+                # there already
+                file_md5 = self.calcmd5(filepath)
+                if file_md5 in library_md5s:
+                    print("Skipping - already uploaded.")
+                    continue
 
             with open(filepath, "rb") as upload_file:
                 jsoned = self._upload_request(
@@ -257,6 +258,10 @@ def parse_args():
             help=("Directory in which to search for music files. Repeat to "
             "search in multiple directories. Default: %(default)s"))
     parser.add_argument("-t", "--tag", action="append", dest="tags")
+    parser.add_argument("--no-skip-duplicates", action="store_false",
+            dest="skip_duplicates",
+            help=("Upload a file even when iBroadcast thinks it's already "
+            "been uploaded."))
 
     return parser.parse_args()
 
@@ -265,4 +270,4 @@ if __name__ == "__main__":
 
     uploader = Uploader(args.login_token)
 
-    uploader.process(args.directories, args.tags)
+    uploader.process(args.directories, args.tags, args.skip_duplicates)
