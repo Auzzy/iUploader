@@ -138,7 +138,7 @@ class Uploader(object):
             # Recurse into subdirectories.
             # XXX Symlinks may cause... issues.
             if os.path.isdir(full_filename):
-                self.load_files(full_filename)
+                files.update(self.load_files(full_filename, filetypes))
 
         return files
 
