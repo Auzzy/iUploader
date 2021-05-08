@@ -272,7 +272,7 @@ def parse_args():
             default=[os.getcwd()], dest="directories",
             help=("Directory in which to search for music files. Repeat to "
             "search in multiple directories. Default: %(default)s"))
-    parser.add_argument("-t", "--tag", action="append", dest="tags")
+    parser.add_argument("-t", "--tag", action="append", dest="tags", default=[])
     parser.add_argument("--no-parallel", action="store_false", dest="parallel",
             help="Disable parallel uploads.")
     parser.add_argument("--no-skip-duplicates", action="store_false",
