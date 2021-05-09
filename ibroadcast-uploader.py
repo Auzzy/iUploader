@@ -21,13 +21,17 @@ if not os.environ.get("DEBUG", False):
 API_URL = "https://api.ibroadcast.com/"
 UPLOAD_URL = "https://upload.ibroadcast.com/"
 
-USER_AGENT = "python 3 uploader script 0.3"
-CLIENT = "python 3 uploader script"
+NAME = "iUploader"
+VERSION = "0.1"
+APP_ID = 1014
+
+USER_AGENT = f"{NAME} {VERSION}"
+CLIENT = NAME
 BASE_API_PAYLOAD = {
-    "app_id": 1007,
-    "version": "0.3",
+    "app_id": APP_ID,
+    "version": VERSION,
     "client": CLIENT,
-    "device_name": "python 3 uploader script",
+    "device_name": NAME,
     "user_agent": USER_AGENT
 }
 
