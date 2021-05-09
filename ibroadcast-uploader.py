@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor as PoolExecutor, as_completed
 
 import requests
@@ -33,18 +34,10 @@ BASE_API_PAYLOAD = {
 TRACK_ID_RE_FORMAT = "File {} \((?P<trackid>\d+)\) uploaded successfully and is being processed."
 
 
-class ServerError(Exception):
-    pass
-
-class Uploader(object):
-    """
-    Class for uploading content to iBroadcast.
-    """
-
+class Uploader:
     def __init__(self, login_token):
         self.login_token = login_token
 
-        # Initialise our variables that each function will set.
         self.user_id = None
         self.token = None
 
@@ -61,10 +54,7 @@ class Uploader(object):
             print("Unable to fetch account info: %s" % e)
             return
 
-        files = set()
-        for parent_dir in parent_dirs:
-            files.update(self.load_files(parent_dir, filetypes))
-
+        files = self.discover_files(parent_dirs, filetypes)
         if self.confirm(files):
             tag_ids = self.load_tag_ids(*tag_names)
             self.upload(files, tag_ids, skip_duplicates, parallel)
@@ -79,10 +69,7 @@ class Uploader(object):
         headers = {**req_args.pop("headers", {}), "User-Agent": USER_AGENT}
 
         response = requests.post(url, data=encode_data(data), headers=headers, **req_args)
-
-        if not response.ok:
-            raise ServerError("Server returned bad status: ", response.status_code)
-
+        response.raise_for_status()
         return response.json()
 
     def _api_request(self, mode, **data):
@@ -104,7 +91,7 @@ class Uploader(object):
         jsoned = self._api_request("login_token", login_token=login_token, type="account")
 
         if "user" not in jsoned:
-            raise ValueError(jsoned.message)
+            raise ValueError(jsoned["message"])
 
         print("Login successful - user_id: ", jsoned["user"]["id"])
         self.user_id = jsoned["user"]["id"]
@@ -113,33 +100,19 @@ class Uploader(object):
     def get_supported_filetypes(self):
         jsoned = self._api_request("status", supported_types=1)
         if "user" not in jsoned:
-            raise ValueError(jsoned.message)
+            raise ValueError(jsoned["message"])
 
         print("Account info fetched")
 
         return {filetype["extension"] for filetype in jsoned["supported"]}
 
-    def load_files(self, directory, filetypes):
-        if filetypes is None:
-            raise ValueError("Supported not yet set - have you logged in yet?")
-
+    def discover_files(self, root_directories, filetypes):
         files = set()
-        for full_filename in glob.glob(os.path.join(directory, "*")):
-            filename = os.path.basename(full_filename)
-            # Skip hidden files.
-            if filename.startswith("."):
-                continue
-
-            # Make sure it"s a supported extension.
-            dummy, ext = os.path.splitext(full_filename)
-            if ext in filetypes:
-                files.add(full_filename)
-
-            # Recurse into subdirectories.
-            # XXX Symlinks may cause... issues.
-            if os.path.isdir(full_filename):
-                files.update(self.load_files(full_filename, filetypes))
-
+        for root_directory in root_directories:
+            for dirpath, _, filenames in os.walk(os.path.abspath(root_directory)):
+                for filename in filenames:
+                    if os.path.splitext(filename)[1] in filetypes:
+                        files.add(os.path.join(dirpath, filename))
         return files
 
     def confirm(self, files):
@@ -185,15 +158,9 @@ class Uploader(object):
 
         return tag_ids
 
-    def calcmd5(self, filePath="."):
-        with open(filePath, "rb") as fh:
-            m = hashlib.md5()
-            while True:
-                data = fh.read(8192)
-                if not data:
-                    break
-                m.update(data)
-        return m.hexdigest()
+    def calc_md5(self, filepath):
+        with open(filepath, "rb") as fileobj:
+            return hashlib.md5(fileobj.read()).hexdigest()
 
     def upload(self, files, tag_ids=[], skip_duplicates=True, parallel=True):
         """
@@ -207,28 +174,26 @@ class Uploader(object):
         max_workers = None if parallel else 1
         with PoolExecutor(max_workers=max_workers) as executor:
             promises = []
-            uploaded_track_ids = set()
             for filepath in sorted(files):
                 if skip_duplicates:
-                    # Get an md5 of the file contents and compare it to whats up
-                    # there already
-                    file_md5 = self.calcmd5(filepath)
+                    file_md5 = self.calc_md5(filepath)
                     if file_md5 in library_md5s:
                         print(f"Skipping {filepath} - already uploaded.")
                         continue
 
                 promises.append(executor.submit(self._upload_worker, filepath, tag_ids))
 
-            for promise in as_completed(promises):
-                track_id = promise.result()
-                uploaded_track_ids.add(track_id)
+            start = time.time()
+            uploaded_track_ids = {promise.result() for promise in as_completed(promises)}
+            end = time.time()
 
         print("Done")
+        print(f"Total time spent uploading: {int(end - start)} seconds")
 
         return uploaded_track_ids
 
     def _upload_worker(self, filepath, tag_ids):
-        print(f"Uploading {filepath}...")
+        print(f"[{int(time.time())}] Uploading {filepath}...")
 
         with open(filepath, "rb") as upload_file:
             jsoned = self._upload_request(
@@ -237,8 +202,7 @@ class Uploader(object):
                 files={"file": upload_file})
 
         result = jsoned["result"]
-
-        if result is False:
+        if not result:
             raise ValueError("File upload failed.")
 
         # Extracting the ID of the uploaded track.
@@ -257,7 +221,7 @@ class Uploader(object):
         for tag_id in tag_ids:
             self._api_request("tagtracks", tagid=tag_id, tracks=[track_id])
 
-        print(f"Finished {filepath} ({track_id})")
+        print(f"[{int(time.time())}] Finished {filepath} ({track_id})")
 
         return track_id
 
@@ -266,13 +230,15 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("login_token",
             help=("Your login token. If you don't already have one, visit "
-            "https://ibroadcast.com, log into your account, click the \"Apps\" "
-            "button in the side menu, and enable the app."))
+            "https://ibroadcast.com, log in, click the \"Apps\" button in the "
+            "side menu, and enable the app."))
     parser.add_argument("-d", "--directory", action="append", type=pathlib.Path,
             default=[os.getcwd()], dest="directories",
             help=("Directory in which to search for music files. Repeat to "
             "search in multiple directories. Default: %(default)s"))
-    parser.add_argument("-t", "--tag", action="append", dest="tags", default=[])
+    parser.add_argument("-t", "--tag", action="append", dest="tags", default=[],
+            help=("The list of tags to apply to all these files after they're "
+            "uploaded. Any tags which don't already exist will be created."))
     parser.add_argument("--no-parallel", action="store_false", dest="parallel",
             help="Disable parallel uploads.")
     parser.add_argument("--no-skip-duplicates", action="store_false",
