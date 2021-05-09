@@ -8,7 +8,7 @@ import os
 import pathlib
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor as PoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor as PoolExecutor, as_completed
 
 import requests
 
@@ -199,40 +199,6 @@ class Uploader(object):
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
-        def _upload_worker(filepath):
-            print(f"Uploading {filepath}...")
-
-            with open(filepath, "rb") as upload_file:
-                jsoned = self._upload_request(
-                    file_path=filepath,
-                    method=CLIENT,
-                    files={"file": upload_file})
-
-            result = jsoned["result"]
-
-            if result is False:
-                raise ValueError("File upload failed.")
-
-            # Extracting the ID of the uploaded track.
-            track_id_re = TRACK_ID_RE_FORMAT.format(os.path.basename(filepath))
-            match = re.match(track_id_re, jsoned["message"])
-            if not match:
-                raise ValueError(f"Unexpected message format. Maybe it's changed? '{jsoned['message']}'")
-
-            track_id = int(match.group("trackid"))
-
-            # Tagging the track. Immediately tagging ensures a script failure
-            # will leave at most one untagged track.
-            # The tradeoff is it takes a LOT more requests, so more time and
-            # server load. Best would be for the API to support tagging as part
-            # of the upload request.
-            for tag_id in tag_ids:
-                self._api_request("tagtracks", tagid=tag_id, tracks=[track_id])
-
-            print(f"Finished {filepath} ({track_id})")
-
-            return track_id
-
         if skip_duplicates:
             library_md5s = self._upload_request()["md5"]
 
@@ -251,7 +217,7 @@ class Uploader(object):
                         print(f"Skipping {filepath} - already uploaded.")
                         continue
 
-                promises.append(executor.submit(_upload_worker, filepath))
+                promises.append(executor.submit(self._upload_worker, filepath, tag_ids))
 
             for promise in as_completed(promises):
                 track_id = promise.result()
@@ -260,6 +226,40 @@ class Uploader(object):
         print("Done")
 
         return uploaded_track_ids
+
+    def _upload_worker(self, filepath, tag_ids):
+        print(f"Uploading {filepath}...")
+
+        with open(filepath, "rb") as upload_file:
+            jsoned = self._upload_request(
+                file_path=filepath,
+                method=CLIENT,
+                files={"file": upload_file})
+
+        result = jsoned["result"]
+
+        if result is False:
+            raise ValueError("File upload failed.")
+
+        # Extracting the ID of the uploaded track.
+        track_id_re = TRACK_ID_RE_FORMAT.format(os.path.basename(filepath))
+        match = re.match(track_id_re, jsoned["message"])
+        if not match:
+            raise ValueError(f"Unexpected message format. Maybe it's changed? '{jsoned['message']}'")
+
+        track_id = int(match.group("trackid"))
+
+        # Tagging the track. Immediately tagging ensures a script failure
+        # will leave at most one untagged track.
+        # The tradeoff is it takes a LOT more requests, so more time and
+        # server load. Best would be for the API to support tagging as part
+        # of the upload request.
+        for tag_id in tag_ids:
+            self._api_request("tagtracks", tagid=tag_id, tracks=[track_id])
+
+        print(f"Finished {filepath} ({track_id})")
+
+        return track_id
 
 
 def parse_args():
