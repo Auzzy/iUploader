@@ -177,6 +177,9 @@ class Uploader:
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
+        if skip_duplicates:
+            print("Any duplicates will be skipped and listed at the end.")
+
         library = self._upload_request()["md5"] if skip_duplicates else None
 
         # For now at least, parallel uploads are all or nothing: either the
@@ -186,19 +189,28 @@ class Uploader:
             promises = [executor.submit(self._upload_worker, filepath, tag_ids, library) for filepath in sorted(files)]
 
             start = time.time()
-            uploaded_track_ids = {promise.result() for promise in as_completed(promises) if promise.result()}
+            results = {"skipped": [], "uploaded": []}
+            for promise in as_completed(promises):
+                retval = promise.result()
+                results[retval["result"]].append(retval["info"])
             end = time.time()
 
-        print("Done")
-        print(f"Total time spent uploading: {int(end - start)} seconds")
+        print()
+        if results["skipped"]:
+            skipped_lines = [f"- {info['path']}" for info in sorted(results["skipped"])]
+            print("Skipped tracks:", *skipped_lines, sep="\n", end="\n\n")
 
-        return uploaded_track_ids
+        print(f"Total uploaded: {len(results['uploaded'])}")
+        if skip_duplicates:
+            print(f"Total skipped: {len(results['skipped'])}")
+        print(f"Total time: {int(end - start)} seconds")
+
+        return results
 
     def _upload_worker(self, filepath, tag_ids, library):
         # library is None if we shouldn't check for duplicates.
         if library is not None and self.calc_md5(filepath) in library:
-            print(f"Skipping {filepath} - already uploaded.")
-            return
+            return {"result": "skipped", "info": {"path": filepath}}
 
         print(f"[{int(time.time())}] Uploading {filepath}...")
         with open(filepath, "rb") as upload_file:
@@ -229,7 +241,7 @@ class Uploader:
 
         print(f"[{int(time.time())}] Finished {filepath} ({track_id})")
 
-        return track_id
+        return {"result": "uploaded", "info": {"path": filepath, "id": track_id}}
 
 
 def parse_args():
