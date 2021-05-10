@@ -163,8 +163,15 @@ class Uploader:
         return tag_ids
 
     def calc_md5(self, filepath):
+        # Read the file in chunks, to avoid loading it into memory all at once.
+        md5 = hashlib.md5()
         with open(filepath, "rb") as fileobj:
-            return hashlib.md5(fileobj.read()).hexdigest()
+            while True:
+                data = fileobj.read(8192)
+                if not data:
+                    break
+                md5.update(data)
+        return md5.hexdigest()
 
     def upload(self, files, tag_ids=[], skip_duplicates=True, parallel=True):
         """
