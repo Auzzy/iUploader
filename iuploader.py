@@ -177,25 +177,16 @@ class Uploader:
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
-        if skip_duplicates:
-            library_md5s = self._upload_request()["md5"]
+        library = self._upload_request()["md5"] if skip_duplicates else None
 
         # For now at least, parallel uploads are all or nothing: either the
         # default max workers are used, or one is used.
         max_workers = None if parallel else 1
         with PoolExecutor(max_workers=max_workers) as executor:
-            promises = []
-            for filepath in sorted(files):
-                if skip_duplicates:
-                    file_md5 = self.calc_md5(filepath)
-                    if file_md5 in library_md5s:
-                        print(f"Skipping {filepath} - already uploaded.")
-                        continue
-
-                promises.append(executor.submit(self._upload_worker, filepath, tag_ids))
+            promises = [executor.submit(self._upload_worker, filepath, tag_ids, library) for filepath in sorted(files)]
 
             start = time.time()
-            uploaded_track_ids = {promise.result() for promise in as_completed(promises)}
+            uploaded_track_ids = {promise.result() for promise in as_completed(promises) if promise.result()}
             end = time.time()
 
         print("Done")
@@ -203,9 +194,13 @@ class Uploader:
 
         return uploaded_track_ids
 
-    def _upload_worker(self, filepath, tag_ids):
-        print(f"[{int(time.time())}] Uploading {filepath}...")
+    def _upload_worker(self, filepath, tag_ids, library):
+        # library is None if we shouldn't check for duplicates.
+        if library is not None and self.calc_md5(filepath) in library:
+            print(f"Skipping {filepath} - already uploaded.")
+            return
 
+        print(f"[{int(time.time())}] Uploading {filepath}...")
         with open(filepath, "rb") as upload_file:
             jsoned = self._upload_request(
                 file_path=filepath,
