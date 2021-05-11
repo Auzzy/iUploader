@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import collections
 import glob
 import hashlib
 import json
@@ -9,12 +10,14 @@ import pathlib
 import re
 import sys
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor as PoolExecutor, as_completed
 
 import requests
 
 
-if os.environ.get("DEBUG", "False") != "True":
+DEBUG = os.environ.get("DEBUG", "false").lower() in ("true", "yes", "y")
+if not DEBUG:
     sys.tracebacklimit = 0
 
 
@@ -61,10 +64,10 @@ class Uploader:
 
         files = self.discover_files(parent_dirs, filetypes)
         if self.confirm(files):
-            tag_ids = self.load_tag_ids(*tag_names)
-            self.upload(files, tag_ids, skip_duplicates, parallel)
+            tags = self.load_tags(*tag_names)
+            self.upload(files, tags, skip_duplicates, parallel)
 
-    def _request(self, url, data, encode_data=lambda val: val, **req_args):
+    def _request(self, url, data, encode_data=lambda val: val, *, check_result=True, **req_args):
         # provide the auth parameters if they"re set.
         if self.user_id:
             data["user_id"] = self.user_id
@@ -75,9 +78,18 @@ class Uploader:
 
         response = requests.post(url, data=encode_data(data), headers=headers, **req_args)
         response.raise_for_status()
-        return response.json()
 
-    def _api_request(self, mode, **data):
+        response_json = response.json()
+        if check_result:
+            if "result" not in response_json:
+                raise KeyError("\"result\" key not found in the response. Please contact the owner of this script, "
+                        "as this may indicate it needs to be updated.")
+            elif not response_json["result"]:
+                raise ValueError(f"The server failed to perform the desired action. Details: {response_json}.")
+
+        return response_json
+
+    def _api_request(self, mode, *, check_result=True, **data):
         if mode == "library":
             return self._library_request(**data)
 
@@ -86,13 +98,13 @@ class Uploader:
             **data,
             **BASE_API_PAYLOAD
         }
-        return self._request(API_URL, post_json, json.dumps)
+        return self._request(API_URL, post_json, encode_data=json.dumps, check_result=check_result)
 
-    def _library_request(self, **data):
-        return self._request(LIBRARY_URL, data, encode_data=json.dumps)
+    def _library_request(self, *, check_result=True, **data):
+        return self._request(LIBRARY_URL, data, encode_data=json.dumps, check_result=check_result)
 
-    def _upload_request(self, *, files={}, **data):
-        return self._request(UPLOAD_URL, data, files=files)
+    def _upload_request(self, *, files={}, check_result=True, **data):
+        return self._request(UPLOAD_URL, data, files=files, check_result=check_result)
 
     def login(self, login_token=None):
         # Default to passed in values, but fallback to initial data.
@@ -149,25 +161,25 @@ class Uploader:
         print("Aborting")
         return False
 
-    def load_tag_ids(self, *tag_names):
+    def load_tags(self, *tag_names):
         tags_info = self._library_request()["library"]["tags"]
 
         # Tags have their ID as the key, and the name inside. So we need to
         # iterate over all of them, checking whose names are in the requested
         # list, and collection those IDs.
-        tag_ids = set()
+        tags = {}
         missing_tags = set(tag_names)
         for tag_id, info in tags_info.items():
             if info["name"] in tag_names:
-                tag_ids.add(tag_id)
+                tags[info["name"]] = tag_id
                 missing_tags.remove(info["name"])
 
         # If any of the requested tag names were not found, we create them, and
         # add their ID to the list.
         for tag_name in missing_tags:
-            tag_ids.add(self._api_request("createtag", tagname=tag_name)["id"])
+            tags[tag_name] = self._api_request("createtag", tagname=tag_name)["id"]
 
-        return tag_ids
+        return tags
 
     def calc_md5(self, filepath):
         # Read the file in chunks, to avoid loading it into memory all at once.
@@ -180,7 +192,7 @@ class Uploader:
                 md5.update(data)
         return md5.hexdigest()
 
-    def upload(self, files, tag_ids=[], skip_duplicates=True, parallel=True):
+    def upload(self, files, tags={}, skip_duplicates=True, parallel=True):
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
@@ -193,57 +205,94 @@ class Uploader:
         # default max workers are used, or one is used.
         max_workers = None if parallel else 1
         with PoolExecutor(max_workers=max_workers) as executor:
-            promises = [executor.submit(self._upload_worker, filepath, tag_ids, library) for filepath in sorted(files)]
+            promises = [executor.submit(self._upload_worker, filepath, tags, library) for filepath in sorted(files)]
 
             start = time.time()
-            results = {"skipped": [], "uploaded": []}
+            results = collections.defaultdict(list)
             for promise in as_completed(promises):
                 retval = promise.result()
                 results[retval["result"]].append(retval["info"])
             end = time.time()
 
-        print()
         if results["skipped"]:
-            skipped_lines = [f"- {info['path']}" for info in sorted(results["skipped"], key=lambda val: val["path"])]
-            print("Skipped tracks:", *skipped_lines, sep="\n", end="\n\n")
+            sorted_skipped = sorted(results["skipped"], key=lambda val: val["path"])
+            skipped_lines = [f"- {info['path']}" for info in sorted_skipped]
+            print("\nSkipped tracks:", *skipped_lines, sep="\n")
 
-        print(f"Total uploaded: {len(results['uploaded'])}")
+        if results["error"]:
+            error_lines = []
+            for info in sorted(results["error"], key=lambda val: val["path"]):
+                error_lines.append(f"- {info['path']}")
+                error_lines.append(f"  Error: {info['summary']}")
+                if DEBUG:
+                    error_lines.append(f"  Debug info: {info['debug']}")
+            print("\nFailed to upload:", *error_lines, sep="\n")
+
+        print(f"\nTotal uploaded: {len(results['uploaded'])}")
         if skip_duplicates:
             print(f"Total skipped: {len(results['skipped'])}")
+        if results["error"]:
+            print(f"Total failed: {len(results['error'])}")
         print(f"Total time: {int(end - start)} seconds")
 
         return results
 
-    def _upload_worker(self, filepath, tag_ids, library):
+    def _upload_worker(self, filepath, tags, library):
+        def _err_result(summary, **extra):
+            exc_info = sys.exc_info()
+
+            if all(exc_info):
+                debug_details = {
+                    "traceback": "".join(traceback.format_exception(*exc_info)),
+                    "message": str(exc_info[1])
+                }
+            else:
+                debug_details = {
+                    "traceback": "".join(traceback.format_stack())
+                }
+
+            return {"result": "error", "info": {
+                "path": filepath, "summary": summary, "debug": {**debug_details, **extra}}}
+
         # library is None if we shouldn't check for duplicates.
         if library is not None and self.calc_md5(filepath) in library:
             return {"result": "skipped", "info": {"path": filepath}}
 
         print(f"[{int(time.time())}] Uploading {filepath}...")
-        with open(filepath, "rb") as upload_file:
-            jsoned = self._upload_request(
-                file_path=filepath,
-                method=CLIENT,
-                files={"file": upload_file})
+        try:
+            with open(filepath, "rb") as upload_file:
+                jsoned = self._upload_request(
+                    file_path=filepath,
+                    method=CLIENT,
+                    files={"file": upload_file},
+                    check_result=False)
+        except Exception:
+            return _err_result("File upload request error.")
 
         result = jsoned["result"]
         if not result:
-            raise ValueError("File upload failed.")
+            return _err_result("File upload failed.", response=jsoned)
 
         # Extracting the ID of the uploaded track.
         match = TRACK_ID_RE.match(jsoned["message"])
         if not match:
-            raise ValueError(f"Unexpected message format. Maybe it's changed? '{jsoned['message']}'")
+            return _err_result("Unexpected message format. Maybe it's changed?",
+                    regex=TRACK_ID_RE.pattern, response=jsoned)
 
         track_id = int(match.group("trackid"))
 
         # Tagging the track. Immediately tagging ensures a script failure
-        # will leave at most one untagged track.
+        # will minimize the untagged tracks.
         # The tradeoff is it takes a LOT more requests, so more time and
         # server load. Best would be for the API to support tagging as part
         # of the upload request.
-        for tag_id in tag_ids:
-            self._api_request("tagtracks", tagid=tag_id, tracks=[track_id])
+        for name, id_ in tags.items():
+            try:
+                jsoned = self._api_request("tagtracks", tagid=id_, tracks=[track_id], check_result=False)
+                if not jsoned["result"]:
+                    return _err_result("Failed to apply tag.", tag=name, tag_id=id_)
+            except Exception:
+                return _err_result("Tag track request error.", tag=name, tag_id=id_)
 
         print(f"[{int(time.time())}] Finished {filepath} ({track_id})")
 
