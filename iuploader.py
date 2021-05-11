@@ -35,7 +35,7 @@ BASE_API_PAYLOAD = {
     "user_agent": USER_AGENT
 }
 
-TRACK_ID_RE_FORMAT = "File {} \((?P<trackid>\d+)\) uploaded successfully and is being processed."
+TRACK_ID_RE = re.compile("File .* \((?P<trackid>\d+)\) uploaded successfully and is being processed.")
 
 
 class Uploader:
@@ -224,8 +224,7 @@ class Uploader:
             raise ValueError("File upload failed.")
 
         # Extracting the ID of the uploaded track.
-        track_id_re = TRACK_ID_RE_FORMAT.format(os.path.basename(filepath))
-        match = re.match(track_id_re, jsoned["message"])
+        match = TRACK_ID_RE.match(jsoned["message"])
         if not match:
             raise ValueError(f"Unexpected message format. Maybe it's changed? '{jsoned['message']}'")
 
