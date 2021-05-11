@@ -197,7 +197,7 @@ class Uploader:
 
         print()
         if results["skipped"]:
-            skipped_lines = [f"- {info['path']}" for info in sorted(results["skipped"])]
+            skipped_lines = [f"- {info['path']}" for info in sorted(results["skipped"], key=lambda val: val["path"])]
             print("Skipped tracks:", *skipped_lines, sep="\n", end="\n\n")
 
         print(f"Total uploaded: {len(results['uploaded'])}")
