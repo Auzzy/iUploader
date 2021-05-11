@@ -133,7 +133,7 @@ class Uploader:
             for filename in sorted(files):
                 print(f" - {filename}")
             print()
-            print("Press "U" to start the upload if this looks reasonable.")
+            print("Press \"U\" to start the upload if this looks reasonable.")
             response = input("--> ")
         if response.lower() == "u":
             print("Starting upload.")
