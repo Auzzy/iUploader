@@ -14,7 +14,7 @@ from concurrent.futures import ProcessPoolExecutor as PoolExecutor, as_completed
 import requests
 
 
-if not os.environ.get("DEBUG", False):
+if os.environ.get("DEBUG", "False") != "True":
     sys.tracebacklimit = 0
 
 
