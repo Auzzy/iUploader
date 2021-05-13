@@ -19,6 +19,7 @@ if os.environ.get("DEBUG", "False") != "True":
 
 
 API_URL = "https://api.ibroadcast.com/"
+LIBRARY_URL = "https://library.ibroadcast.com/"
 UPLOAD_URL = "https://upload.ibroadcast.com/"
 
 NAME = "iUploader"
@@ -77,12 +78,18 @@ class Uploader:
         return response.json()
 
     def _api_request(self, mode, **data):
+        if mode == "library":
+            return self._library_request(**data)
+
         post_json = {
             "mode": mode,
             **data,
             **BASE_API_PAYLOAD
         }
         return self._request(API_URL, post_json, json.dumps)
+
+    def _library_request(self, **data):
+        return self._request(LIBRARY_URL, data, encode_data=json.dumps)
 
     def _upload_request(self, *, files={}, **data):
         return self._request(UPLOAD_URL, data, files=files)
@@ -143,7 +150,7 @@ class Uploader:
         return False
 
     def load_tag_ids(self, *tag_names):
-        tags_info = self._api_request("library")["library"]["tags"]
+        tags_info = self._library_request()["library"]["tags"]
 
         # Tags have their ID as the key, and the name inside. So we need to
         # iterate over all of them, checking whose names are in the requested
