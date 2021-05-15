@@ -113,7 +113,7 @@ class Uploader:
     def __init__(self, login_token):
         self.client = IBroadcastClient(login_token)
 
-    def process(self, parent_dirs=[], tag_names=[], skip_duplicates=True, parallel=True):
+    def process(self, parent_dirs=[], tag_names=[], playlist_names=[], skip_duplicates=True, parallel=True):
         try:
             self.client.login()
         except ValueError as e:
@@ -121,15 +121,15 @@ class Uploader:
             return
 
         try:
-            filetypes = self.supported_filetypes()
+            filetypes = self.client.supported_filetypes()
         except ValueError as e:
             print("Unable to fetch account info: %s" % e)
             return
 
         files = self.discover_files(parent_dirs, filetypes)
         if self.confirm(files):
-            tags = self.load_tags(*tag_names)
-            self.upload(files, tags, skip_duplicates, parallel)
+            library_info = self.load_library_info(tag_names, playlist_names)
+            self.upload(files, library_info, skip_duplicates, parallel)
 
     def discover_files(self, root_directories, filetypes):
         files = set()
@@ -163,16 +163,21 @@ class Uploader:
         print("Aborting")
         return False
 
-    def load_tags(self, *tag_names):
-        tags_info = self.client.library_request()["library"]["tags"]
+    def load_library_info(self, tag_names, playlist_names):
+        library = self.client.library_request()["library"]
+        return {
+            "tags": self.load_tags(library, tag_names),
+            "playlists": self.load_playlists(library, playlist_names)
+        }
 
+    def load_tags(self, library, names):
         # Tags have their ID as the key, and the name inside. So we need to
         # iterate over all of them, checking whose names are in the requested
         # list, and collection those IDs.
         tags = {}
-        missing_tags = set(tag_names)
-        for tag_id, info in tags_info.items():
-            if info["name"] in tag_names:
+        missing_tags = set(names)
+        for tag_id, info in library["tags"].items():
+            if info["name"] in names:
                 tags[info["name"]] = tag_id
                 missing_tags.remove(info["name"])
 
@@ -182,6 +187,30 @@ class Uploader:
             tags[tag_name] = self.client.api_request("createtag", tagname=tag_name)["id"]
 
         return tags
+
+    def load_playlists(self, library, names):
+        # Playlists have their ID as the key, and the rest of their info
+        # presented as a list. The keys for this list come from another field.
+        # So we need to iterate over all of them, perform this mapping, then
+        # check whose names are in the requested list, and collect those IDs.
+        playlists_dict = library["playlists"].copy()
+        field_map = playlists_dict.pop("map")
+        fields = sorted(field_map.keys(), key=lambda key: field_map[key])
+
+        playlists = {}
+        missing_playlists = set(names)
+        for playlist_id, info_list in playlists_dict.items():
+            info = dict(zip(fields, info_list))
+            if info["name"] in names:
+                playlists[info["name"]] = playlist_id
+                missing_playlists.remove(info["name"])
+
+        # If any of the requested playlist names were not found, we create them, and
+        # add their ID to the list.
+        for name in missing_playlists:
+            playlists[name] = self.client.api_request("createplaylist", name=name)["playlist_id"]
+
+        return playlists
 
     def calc_md5(self, filepath):
         # Read the file in chunks, to avoid loading it into memory all at once.
@@ -194,7 +223,7 @@ class Uploader:
                 md5.update(data)
         return md5.hexdigest()
 
-    def upload(self, files, tags={}, skip_duplicates=True, parallel=True):
+    def upload(self, files, library_info, skip_duplicates=True, parallel=True):
         """
         Go and perform an upload of any files that haven"t yet been uploaded
         """
@@ -207,7 +236,7 @@ class Uploader:
         # default max workers are used, or one is used.
         max_workers = None if parallel else 1
         with PoolExecutor(max_workers=max_workers) as executor:
-            promises = [executor.submit(self._upload_worker, filepath, tags, library) for filepath in sorted(files)]
+            promises = [executor.submit(self._upload_worker, filepath, library_info, library) for filepath in sorted(files)]
 
             start = time.time()
             results = collections.defaultdict(list)
@@ -239,7 +268,7 @@ class Uploader:
 
         return results
 
-    def _upload_worker(self, filepath, tags, library):
+    def _upload_worker(self, filepath, library_info, library):
         def _err_result(summary, **extra):
             exc_info = sys.exc_info()
 
@@ -288,13 +317,24 @@ class Uploader:
         # The tradeoff is it takes a LOT more requests, so more time and
         # server load. Best would be for the API to support tagging as part
         # of the upload request.
-        for name, id_ in tags.items():
+        # Note: Looks like it does, but only a single tag. So not useful here.
+        for name, id_ in library_info["tags"].items():
             try:
                 jsoned = self.client.api_request("tagtracks", tagid=id_, tracks=[track_id], check_result=False)
                 if not jsoned["result"]:
                     return _err_result("Failed to apply tag.", tag=name, tag_id=id_)
             except Exception:
                 return _err_result("Tag track request error.", tag=name, tag_id=id_)
+
+        # Adding the track to playlist(s). The same caveats apply as above,
+        # including that the upload endpoint accepts a single playlist name.
+        for name, id_ in library_info["playlists"].items():
+            try:
+                jsoned = self.client.api_request("appendplaylist", playlist=id_, tracks=[track_id], check_result=False)
+                if not jsoned["result"]:
+                    return _err_result("Failed to add to playlist.", playlist=name, playlist_id=id_)
+            except Exception:
+                return _err_result("Add to playlist request error.", playlist=name, playlist_id=id_)
 
         print(f"[{int(time.time())}] Finished {filepath} ({track_id})")
 
@@ -306,18 +346,19 @@ def parse_args():
     parser.add_argument("login_token",
             help=("Your login token. If you don't already have one, visit "
             "https://ibroadcast.com, log in, click the \"Apps\" button in the "
-            "side menu, and enable the app."))
-    parser.add_argument("-d", "--directory", action="append", type=pathlib.Path,
-            default=[os.getcwd()], dest="directories",
+            "side menu, and enable this app."))
+    parser.add_argument("-d", "--directory", action="append", type=pathlib.Path, default=[os.getcwd()], dest="dirs",
             help=("Directory in which to search for music files. Repeat to "
             "search in multiple directories. Default: %(default)s"))
     parser.add_argument("-t", "--tag", action="append", dest="tags", default=[],
-            help=("The list of tags to apply to all these files after they're "
-            "uploaded. Any tags which don't already exist will be created."))
+            help=("Apply this tag all discovered files after uploading, and "
+            "create it if needed. Repeat this argument for multiple tags."))
+    parser.add_argument("-p", "--playlist", action="append", dest="playlists", default=[],
+            help=("Add all all discovered files to this playlist, and create it "
+            "if needed. Repeat this argument for multiple playlists."))
     parser.add_argument("--no-parallel", action="store_false", dest="parallel",
             help="Disable parallel uploads.")
-    parser.add_argument("--no-skip-duplicates", action="store_false",
-            dest="skip_duplicates",
+    parser.add_argument("--no-skip-duplicates", action="store_false", dest="skip_duplicates",
             help=("Upload a file even when iBroadcast thinks it's already "
             "been uploaded."))
 
@@ -328,4 +369,4 @@ if __name__ == "__main__":
 
     uploader = Uploader(args.login_token)
 
-    uploader.process(args.directories, args.tags, args.skip_duplicates, args.parallel)
+    uploader.process(args.dirs, args.tags, args.playlists, args.skip_duplicates, args.parallel)
