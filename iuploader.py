@@ -42,30 +42,12 @@ BASE_API_PAYLOAD = {
 TRACK_ID_RE = re.compile("File .* \((?P<trackid>\d+)\) uploaded successfully and is being processed.")
 
 
-class Uploader:
+class IBroadcastClient:
     def __init__(self, login_token):
         self.login_token = login_token
 
         self.user_id = None
         self.token = None
-
-    def process(self, parent_dirs=[], tag_names=[], skip_duplicates=True, parallel=True):
-        try:
-            self.login()
-        except ValueError as e:
-            print("Login failed: %s" % e)
-            return
-
-        try:
-            filetypes = self.get_supported_filetypes()
-        except ValueError as e:
-            print("Unable to fetch account info: %s" % e)
-            return
-
-        files = self.discover_files(parent_dirs, filetypes)
-        if self.confirm(files):
-            tags = self.load_tags(*tag_names)
-            self.upload(files, tags, skip_duplicates, parallel)
 
     def _request(self, url, data, encode_data=lambda val: val, *, check_result=True, **req_args):
         # provide the auth parameters if they"re set.
@@ -89,9 +71,9 @@ class Uploader:
 
         return response_json
 
-    def _api_request(self, mode, *, check_result=True, **data):
+    def api_request(self, mode, *, check_result=True, **data):
         if mode == "library":
-            return self._library_request(**data)
+            return self.library_request(**data)
 
         post_json = {
             "mode": mode,
@@ -100,34 +82,54 @@ class Uploader:
         }
         return self._request(API_URL, post_json, encode_data=json.dumps, check_result=check_result)
 
-    def _library_request(self, *, check_result=True, **data):
+    def library_request(self, *, check_result=True, **data):
         return self._request(LIBRARY_URL, data, encode_data=json.dumps, check_result=check_result)
 
-    def _upload_request(self, *, files={}, check_result=True, **data):
+    def upload_request(self, *, files={}, check_result=True, **data):
         return self._request(UPLOAD_URL, data, files=files, check_result=check_result)
 
-    def login(self, login_token=None):
-        # Default to passed in values, but fallback to initial data.
-        login_token = login_token or self.login_token
 
-        print("Logging in...")
-        jsoned = self._api_request("login_token", login_token=login_token, type="account")
+    def login(self):
+        jsoned = self.api_request("login_token", login_token=self.login_token, type="account")
 
         if "user" not in jsoned:
             raise ValueError(jsoned["message"])
 
-        print("Login successful - user_id: ", jsoned["user"]["id"])
         self.user_id = jsoned["user"]["id"]
         self.token = jsoned["user"]["token"]
-
-    def get_supported_filetypes(self):
-        jsoned = self._api_request("status", supported_types=1)
+    
+    def supported_filetypes(self):
+        jsoned = self.api_request("status", supported_types=1)
         if "user" not in jsoned:
             raise ValueError(jsoned["message"])
 
         print("Account info fetched")
 
         return {filetype["extension"] for filetype in jsoned["supported"]}
+
+
+
+class Uploader:
+    def __init__(self, login_token):
+        self.client = IBroadcastClient(login_token)
+
+    def process(self, parent_dirs=[], tag_names=[], skip_duplicates=True, parallel=True):
+        try:
+            self.client.login()
+        except ValueError as e:
+            print("Login failed: %s" % e)
+            return
+
+        try:
+            filetypes = self.supported_filetypes()
+        except ValueError as e:
+            print("Unable to fetch account info: %s" % e)
+            return
+
+        files = self.discover_files(parent_dirs, filetypes)
+        if self.confirm(files):
+            tags = self.load_tags(*tag_names)
+            self.upload(files, tags, skip_duplicates, parallel)
 
     def discover_files(self, root_directories, filetypes):
         files = set()
@@ -162,7 +164,7 @@ class Uploader:
         return False
 
     def load_tags(self, *tag_names):
-        tags_info = self._library_request()["library"]["tags"]
+        tags_info = self.client.library_request()["library"]["tags"]
 
         # Tags have their ID as the key, and the name inside. So we need to
         # iterate over all of them, checking whose names are in the requested
@@ -177,7 +179,7 @@ class Uploader:
         # If any of the requested tag names were not found, we create them, and
         # add their ID to the list.
         for tag_name in missing_tags:
-            tags[tag_name] = self._api_request("createtag", tagname=tag_name)["id"]
+            tags[tag_name] = self.client.api_request("createtag", tagname=tag_name)["id"]
 
         return tags
 
@@ -199,7 +201,7 @@ class Uploader:
         if skip_duplicates:
             print("Any duplicates will be skipped and listed at the end.")
 
-        library = self._upload_request()["md5"] if skip_duplicates else None
+        library = self.client.upload_request()["md5"] if skip_duplicates else None
 
         # For now at least, parallel uploads are all or nothing: either the
         # default max workers are used, or one is used.
@@ -261,7 +263,7 @@ class Uploader:
         print(f"[{int(time.time())}] Uploading {filepath}...")
         try:
             with open(filepath, "rb") as upload_file:
-                jsoned = self._upload_request(
+                jsoned = self.client.upload_request(
                     file_path=filepath,
                     method=CLIENT,
                     files={"file": upload_file},
@@ -288,7 +290,7 @@ class Uploader:
         # of the upload request.
         for name, id_ in tags.items():
             try:
-                jsoned = self._api_request("tagtracks", tagid=id_, tracks=[track_id], check_result=False)
+                jsoned = self.client.api_request("tagtracks", tagid=id_, tracks=[track_id], check_result=False)
                 if not jsoned["result"]:
                     return _err_result("Failed to apply tag.", tag=name, tag_id=id_)
             except Exception:
